@@ -1,7 +1,10 @@
 // Eth
-import { bigIntToHex, bytesToHex, PrefixedHexString, stripHexPrefix } from "../deps.ts";
-
-export const NULL_BLOCK_HASH = padString("0x", 32);
+import {
+  bigIntToHex,
+  bytesToHex,
+  PrefixedHexString,
+  stripHexPrefix,
+} from "../deps.ts";
 
 /**
  * @param hex - A decimal string.

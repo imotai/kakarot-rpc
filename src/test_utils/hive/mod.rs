@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use ef_testing::evm_sequencer::account::KakarotAccount;
-use ethers::types::U256 as EthersU256;
 use katana_primitives::{
     contract::ContractAddress,
     genesis::json::{GenesisContractJson, GenesisJson},
@@ -20,7 +19,7 @@ use super::{
     katana::genesis::{KatanaGenesisBuilder, Loaded},
 };
 
-/// Types from https://github.com/ethereum/go-ethereum/blob/master/core/genesis.go#L49C1-L58
+/// Types from <https://github.com/ethereum/go-ethereum/blob/master/core/genesis.go#L49C1-L58>
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct HiveGenesisConfig {
@@ -53,7 +52,7 @@ pub struct AccountInfo {
 }
 
 impl HiveGenesisConfig {
-    /// Convert the [HiveGenesisConfig] into a [GenesisJson] using an [KatanaGenesisBuilder]<[Loaded]>. The [Loaded]
+    /// Convert the [`HiveGenesisConfig`] into a [`GenesisJson`] using an [`KatanaGenesisBuilder`]<[Loaded]>. The [Loaded]
     /// marker type indicates that the Kakarot contract classes need to have been loaded into the builder.
     pub fn try_into_genesis_json(self, builder: KatanaGenesisBuilder<Loaded>) -> Result<GenesisJson, eyre::Error> {
         let coinbase_address = FieldElement::from_byte_slice_be(self.coinbase.as_slice())?;
@@ -83,8 +82,7 @@ impl HiveGenesisConfig {
                 let code = info.code.unwrap_or_default();
                 let storage = info.storage.unwrap_or_default();
                 let storage: Vec<(U256, U256)> = storage.into_iter().collect();
-                let is_eoa = code.is_empty() & storage.is_empty();
-                let kakarot_account = KakarotAccount::new(&address, &code, U256::ZERO, &storage, is_eoa)?;
+                let kakarot_account = KakarotAccount::new(&address, &code, U256::ZERO, &storage)?;
 
                 let mut kakarot_account_storage: Vec<(FieldElement, FieldElement)> =
                     kakarot_account.storage().iter().map(|(k, v)| ((*k.0.key()).into(), (*v).into())).collect();
@@ -109,7 +107,7 @@ impl HiveGenesisConfig {
                     ContractAddress::new(starknet_address),
                     GenesisContractJson {
                         class: Some(account_contract_class_hash.0.into()),
-                        balance: Some(EthersU256::from_big_endian(&info.balance.to_be_bytes::<32>())),
+                        balance: Some(info.balance),
                         nonce: None,
                         storage: Some(kakarot_account_storage.into_iter().collect()),
                     },
@@ -123,7 +121,7 @@ impl HiveGenesisConfig {
 
         let kakarot_contract = genesis.contracts.entry(kakarot_address);
         kakarot_contract.and_modify(|contract| {
-            contract.storage.get_or_insert_with(HashMap::new).extend(additional_kakarot_storage)
+            contract.storage.get_or_insert_with(HashMap::new).extend(additional_kakarot_storage);
         });
 
         genesis.fee_token.storage.get_or_insert_with(HashMap::new).extend(fee_token_storage);
@@ -179,7 +177,7 @@ mod tests {
             let contract = GENESIS.contracts.get(&ContractAddress::new(starknet_address)).unwrap();
 
             // Check the balance
-            assert_eq!(contract.balance, Some(EthersU256::from_big_endian(&account.balance.to_be_bytes::<32>())));
+            assert_eq!(contract.balance, Some(account.balance));
             // Check the storage
             for (key, value) in account.storage.unwrap_or_default() {
                 let key = get_storage_var_address(ACCOUNT_STORAGE, &split_u256::<FieldElement>(key)).unwrap();

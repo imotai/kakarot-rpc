@@ -1,11 +1,11 @@
 # trunk-ignore-all(terrascan/AC_DOCKER_0047)
 
 # CairoVM Chain
-FROM ghcr.io/dojoengine/dojo:v0.6.0-alpha.6 as katana
+FROM ghcr.io/dojoengine/dojo:v0.7.0-alpha.0 as katana
 
 # Indexer service
 ### Apibara DNA indexer and indexer
-FROM quay.io/apibara/starknet:1.4.1 as apibara
+FROM quay.io/apibara/starknet:1.5.0 as apibara
 FROM quay.io/apibara/sink-mongo:0.7.0 as indexer
 FROM debian:bookworm as apibara-build
 RUN apt-get update && apt-get install --no-install-recommends -y patchelf && rm -rf /var/lib/apt/lists/*
@@ -15,16 +15,17 @@ RUN apt-get update && apt-get install --no-install-recommends -y patchelf && rm 
 # Depending on the platform, the path to the binaries will be different
 # These values need to be updated if the version of ApiBara Starknet or Sink change.
 # platform: linux/amd64:
-#   - APIBARA_STARKNET_BIN_DIR: dsrifc349xgnwsv661shqljxb8pbxx2j
+#   - APIBARA_STARKNET_BIN_DIR: ns4qwsl6fgbv7mxhxpnaqhd66wnic8i6
 #   - APIBARA_SINK_BIN_DIR: sci7y4a8r7yz05094pl88h3d7vv1s98f
 # platform: linux/arm64
-#   - APIBARA_STARKNET_BIN_DIR: f7va4mjqww1kkpp4il6y295dgcwq147v
+#   - APIBARA_STARKNET_BIN_DIR: 3fz40zh8pscx7wp54nb78wm6p5y2v3g0
 #   - APIBARA_SINK_BIN_DIR: 5p0wgpyfsk19v8rrprnykiv5inzx8zag
 ARG APIBARA_STARKNET_BIN_DIR
 ARG APIBARA_SINK_BIN_DIR
-# Run `docker image inspect apibara/starknet:1.4.1-x86_64` to get the exact path
+# Run `docker image inspect apibara/starknet:1.5.0-x86_64` to get the exact path
+# Run `docker image inspect apibara/starknet:1.5.0-aarch64` to get the exact path
 # ⚠️ This path is subject to change, so it's important to check it before building the image ⚠️
-COPY --from=apibara /nix/store/${APIBARA_STARKNET_BIN_DIR}-apibara-starknet-1.4.1/bin/apibara-starknet /usr/local/bin/starknet
+COPY --from=apibara /nix/store/${APIBARA_STARKNET_BIN_DIR}-apibara-starknet-1.5.0/bin/apibara-starknet /usr/local/bin/starknet
 COPY --from=indexer /nix/store/${APIBARA_SINK_BIN_DIR}-apibara-sink-mongo-0.7.0/bin/apibara-sink-mongo /usr/local/bin/sink-mongo
 # Change the interpreter path.
 ARG BUILDPLATFORM
@@ -76,7 +77,7 @@ COPY . .
 # Similar to `make setup` but we remove the `make build-sol` step
 # which uses docker to build the experimental solidity contracts.
 # Using docker in docker is not supported in the current setup.
-RUN chmod +x ./scripts/extract_abi.sh \ 
+RUN chmod +x ./scripts/extract_abi.sh \
     && git submodule update --init --recursive \
     && cd lib/kakarot && make setup && make build \
     && mv build/ssj/contracts_Cairo1Helpers.contract_class.json build/cairo1_helpers.json && rm -fr build/ssj && cd ../.. \
@@ -118,7 +119,7 @@ RUN cargo build \
     cargo build \
     --bin hive_chain --release --features testing --target-dir /usr/src/rpc/target
 
-FROM debian:bookworm-slim as base
+FROM ubuntu:24.10 as base
 # Install any necessary dependencies
 RUN apt-get update && apt-get install --no-install-recommends -y tini curl jq libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
 
@@ -141,8 +142,10 @@ ENV ALLOW_NET=""
 ### Port 8545: https://github.com/ethereum/hive/blob/master/simulators/ethereum/rpc/helper.go#L50
 ENV KAKAROT_RPC_URL=0.0.0.0:8545
 ENV STARKNET_NETWORK=http://localhost:5050
-ENV RUST_LOG=kakarot_rpc=info
+ENV RUST_LOG=info
 ENV MAX_FELTS_IN_CALLDATA=30000
+ENV TRANSACTION_MAX_RETRIES=10
+ENV MAX_LOGS=10000
 ENV RETRY_TX_INTERVAL=10
 ENV DEFAULT_BLOCK_GAS_LIMIT=7000000
 

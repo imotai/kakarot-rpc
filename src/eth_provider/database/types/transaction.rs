@@ -37,7 +37,7 @@ impl<'a> StoredTransaction {
                 block_number: Some(u64::arbitrary(u)?),
                 transaction_index: Some(u64::arbitrary(u)?),
                 gas_price: Some(u128::arbitrary(u)?),
-                gas: u64::arbitrary(u)? as u128,
+                gas: u128::from(u64::arbitrary(u)?),
                 max_fee_per_gas: if TryInto::<TxType>::try_into(transaction_type).unwrap() == TxType::Legacy {
                     None
                 } else {
@@ -53,7 +53,7 @@ impl<'a> StoredTransaction {
                     ..reth_rpc_types::Signature::arbitrary(u)?
                 }),
                 transaction_type: Some(transaction_type),
-                chain_id: Some(u32::arbitrary(u)? as u64),
+                chain_id: Some(u64::from(u32::arbitrary(u)?)),
                 other: Default::default(),
                 access_list: Some(reth_rpc_types::AccessList::arbitrary(u)?),
                 ..transaction
@@ -68,42 +68,32 @@ pub struct StoredPendingTransaction {
     #[serde(deserialize_with = "crate::eth_provider::database::types::serde::deserialize_intermediate")]
     pub tx: Transaction,
     /// Number of retries
-    pub retries: u64,
+    pub retries: u8,
 }
 
 impl StoredPendingTransaction {
-    pub fn new(tx: Transaction, retries: u64) -> Self {
+    pub const fn new(tx: Transaction, retries: u8) -> Self {
         Self { tx, retries }
     }
 }
 
-impl From<Transaction> for StoredPendingTransaction {
-    fn from(tx: Transaction) -> Self {
-        Self { tx, retries: 0 }
+#[cfg(any(test, feature = "arbitrary", feature = "testing"))]
+impl<'a> StoredPendingTransaction {
+    pub fn arbitrary_with_optional_fields(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self { tx: StoredTransaction::arbitrary_with_optional_fields(u)?.into(), retries: u8::arbitrary(u)? })
     }
 }
 
-/// A transaction hash as stored in the database
-/// This wrapper is used to deserialize a transaction
-/// from the database, on which a projection was
-/// performed in order to only return the transaction
-/// hash (e.g. {tx: {hash: "0x1234"}})
-#[derive(Debug, Deserialize)]
-pub struct StoredTransactionHash {
-    #[serde(rename = "tx")]
-    pub tx_hash: Hash,
+impl From<StoredPendingTransaction> for Transaction {
+    fn from(tx: StoredPendingTransaction) -> Self {
+        tx.tx
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Hash {
     pub hash: B256,
-}
-
-impl From<StoredTransactionHash> for B256 {
-    fn from(hash: StoredTransactionHash) -> Self {
-        hash.tx_hash.hash
-    }
 }
 
 #[cfg(test)]

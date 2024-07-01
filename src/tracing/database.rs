@@ -10,10 +10,11 @@ use reth_revm::{
     primitives::{Account, AccountInfo, Bytecode},
     Database, DatabaseCommit,
 };
-use reth_rpc_types::{serde_helpers::JsonStorageKey, BlockId, BlockNumberOrTag};
+use reth_rpc_types::{serde_helpers::JsonStorageKey, BlockHashOrNumber, BlockId, BlockNumberOrTag};
 use tokio::runtime::Handle;
 
 #[derive(Debug)]
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) struct EthDatabaseSnapshot<P: EthereumProvider + Send + Sync> {
     cache: CacheDB<P>,
     block_id: BlockId,
@@ -67,9 +68,7 @@ impl<P: EthereumProvider + Send + Sync> Database for EthDatabaseSnapshot<P> {
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let cache = &self.cache;
         if let Some(account) = cache.accounts.get(&address) {
-            if let Some(storage) = account.storage.get(&index) {
-                return Ok(*storage);
-            }
+            return Ok(account.storage.get(&index).copied().unwrap_or_default());
         }
 
         let storage = Handle::current().block_on(async {
@@ -96,13 +95,13 @@ impl<P: EthereumProvider + Send + Sync> Database for EthDatabaseSnapshot<P> {
             return Ok(*hash);
         }
 
-        let block_number = number.try_into().map_err(|_| EthereumDataFormatError::PrimitiveError)?;
+        let block_number = number.try_into().map_err(|_| EthereumDataFormatError::Primitive)?;
         let hash = Handle::current().block_on(async {
             let hash = cache
                 .db
                 .block_by_number(BlockNumberOrTag::Number(block_number), false)
                 .await?
-                .ok_or(EthApiError::UnknownBlock)?
+                .ok_or(EthApiError::UnknownBlock(BlockHashOrNumber::Number(block_number)))?
                 .header
                 .hash
                 .unwrap_or_default();
@@ -116,13 +115,13 @@ impl<P: EthereumProvider + Send + Sync> Database for EthDatabaseSnapshot<P> {
 
 impl<P: EthereumProvider + Send + Sync> DatabaseCommit for EthDatabaseSnapshot<P> {
     fn commit(&mut self, changes: HashMap<Address, Account>) {
-        changes.into_iter().for_each(|(address, account)| {
+        for (address, account) in changes {
             let db_account = DbAccount {
                 info: account.info.clone(),
                 storage: account.storage.into_iter().map(|(k, v)| (k, v.present_value)).collect(),
                 account_state: AccountState::None,
             };
             self.cache.accounts.insert(address, db_account);
-        });
+        }
     }
 }

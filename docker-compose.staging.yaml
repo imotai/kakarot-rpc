@@ -15,7 +15,13 @@ services:
       --http-port 6060
       --db-path /var/lib/juno
       --eth-node ${ETH_NODE_WS}
-      --network sepolia
+      --cn-name KKRT_BETA
+      --cn-feeder-url https://gateway-beta.kakarot.sw-dev.io/feeder_gateway/
+      --cn-gateway-url https://gateway-beta.kakarot.sw-dev.io/gateway/
+      --cn-l1-chain-id 11155111
+      --cn-l2-chain-id kkrt
+      --cn-core-contract-address 0xc7c9ea7fD0921Cb6EDd9a3184F88cF1b821aA82B
+      --cn-unverifiable-range 0,0
     networks:
       - internal_staging
   starknet-explorer:
@@ -57,24 +63,27 @@ services:
       - starknet_explorer_staging:/var/lib/postgresql/data/
 
   kakarot-rpc:
-    image: ghcr.io/kkrt-labs/kakarot-rpc/node:latest
+    image: ghcr.io/kkrt-labs/kakarot-rpc/node:v0.6.19-alpha2
     pull_policy: always
     ports:
       - 3030:3030
     environment:
       - KAKAROT_RPC_URL=0.0.0.0:3030
       - STARKNET_NETWORK=http://starknet:6060
-      - RUST_LOG=kakarot_rpc=info
+      - RUST_LOG=info
       - MONGO_CONNECTION_STRING=mongodb://mongo:mongo@mongo:27017
       - MONGO_DATABASE_NAME=kakarot-local
       # These values are unique to Sepolia Testnet
       # They'll need to be manually changed in case the testnet is reset
       # To add robustness: parse the `deployments/starknet-sepolia` folder in `kkrt-labs/kakarot` repo
-      - KAKAROT_ADDRESS=0x464f7e37179d2f93ea208795bdb2d0912e8257f6fb5f67ae2559251523aee19
-      - UNINITIALIZED_ACCOUNT_CLASS_HASH=0x1d8b8047e26b484d3f6262d1967217d980d0f2dfc69afa5661492bd5bfe2954
-      - ACCOUNT_CONTRACT_CLASS_HASH=0x56d311021950bf65ee500426e007b9e3ced0db97f9c1e0d29a9e03d79a9bf6c
+      - KAKAROT_ADDRESS=0x2824d6ed6759ac4c4a54a39b78d04c0e48be8937237026bf8c3bf46a8bea722
+      - UNINITIALIZED_ACCOUNT_CLASS_HASH=0x600f6862938312a05a0cfecba0dcaf37693efc9e4075a6adfb62e196022678e
+      - ACCOUNT_CONTRACT_CLASS_HASH=0x1276d0b017701646f8646b69de6c3b3584edce71879678a679f28c07a9971cf
       - MAX_FELTS_IN_CALLDATA=30000
+      - TRANSACTION_MAX_RETRIES=10
+      - MAX_LOGS=10000
       - RETRY_TX_INTERVAL=10
+      - WHITE_LISTED_EIP_155_TRANSACTION_HASHES=0xeddf9e61fb9d8f5111840daef55e5fde0041f5702856532cdbb5a02998033d26,0xb6274b80bc7cda162df89894c7748a5cb7ba2eaa6004183c41a1837c3b072f1e,0x07471adfe8f4ec553c1199f495be97fc8be8e0626ae307281c22534460184ed1,0xb95343413e459a0f97461812111254163ae53467855c0d73e0f1e7c5b8442fa3
     restart: on-failure
     volumes:
       # Mount the indexer code
@@ -94,6 +103,7 @@ services:
       - --rpc=http://starknet:6060
       - --wait-for-rpc
       - --data=/data
+      - --head-refresh-interval-ms=1000
 
   ### MongoDB with Mongo Express
   mongo:
@@ -127,7 +137,7 @@ services:
       - STARKNET_NETWORK=http://starknet:6060
       - ALLOW_NET=
       - MONGO_REPLACE_DATA_INSIDE_TRANSACTION=false
-      - KAKAROT_ADDRESS=0x464f7e37179d2f93ea208795bdb2d0912e8257f6fb5f67ae2559251523aee19
+      - KAKAROT_ADDRESS=0x2824d6ed6759ac4c4a54a39b78d04c0e48be8937237026bf8c3bf46a8bea722
       - DEFAULT_BLOCK_GAS_LIMIT=7000000
     restart: on-failure
     volumes:

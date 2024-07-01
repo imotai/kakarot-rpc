@@ -32,8 +32,21 @@ use jsonrpsee::{server::middleware::rpc::RpcServiceT, types::Request, MethodResp
 use pin_project_lite::pin_project;
 
 /// Histogram time buckets in microseconds.
-const HISTOGRAM_BUCKETS: [f64; 11] =
-    [5.0, 25.0, 100.0, 500.0, 1_000.0, 2_500.0, 10_000.0, 25_000.0, 100_000.0, 1_000_000.0, 10_000_000.0];
+const HISTOGRAM_BUCKETS: [f64; 13] = [
+    5.0,
+    25.0,
+    100.0,
+    500.0,
+    1_000.0,
+    2_500.0,
+    10_000.0,
+    25_000.0,
+    100_000.0,
+    1_000_000.0,
+    2_000_000.0,
+    5_000_000.0,
+    10_000_000.0,
+];
 
 /// Metrics for RPC middleware storing information about the number of requests started/completed,
 /// calls started/completed and their timings.
@@ -93,7 +106,7 @@ pub struct MetricsLayer {
 
 impl MetricsLayer {
     /// Create a new [`MetricsLayer`].
-    pub fn new(metrics: RpcMetrics, transport_label: &'static str) -> Self {
+    pub const fn new(metrics: RpcMetrics, transport_label: &'static str) -> Self {
         Self { inner: metrics, transport_label }
     }
 }
@@ -116,8 +129,8 @@ pub struct Metrics<S> {
 
 impl<S> Metrics<S> {
     /// Create a new metrics middleware.
-    pub fn new(service: S, metrics: RpcMetrics, transport_label: &'static str) -> Metrics<S> {
-        Metrics { service, metrics, transport_label }
+    pub const fn new(service: S, metrics: RpcMetrics, transport_label: &'static str) -> Self {
+        Self { service, metrics, transport_label }
     }
 }
 

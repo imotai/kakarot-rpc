@@ -1,308 +1,122 @@
-use reth_primitives::{
-    AccessList, AccessListItem, Signature, TransactionKind, TransactionSigned, TxEip1559, TxEip2930, TxLegacy, TxType,
-    U256,
+use alloy_rlp::Encodable;
+use reth_primitives::{Transaction, TransactionSigned};
+use starknet_crypto::FieldElement;
+
+#[cfg(not(feature = "hive"))]
+use crate::eth_provider::starknet::kakarot_core::MAX_FELTS_IN_CALLDATA;
+use crate::{
+    eth_provider::{
+        error::{EthApiError, SignatureError, TransactionError},
+        starknet::kakarot_core::{ETH_SEND_TRANSACTION, KAKAROT_ADDRESS, WHITE_LISTED_EIP_155_TRANSACTION_HASHES},
+        utils::split_u256,
+    },
+    tracing::builder::TRACING_BLOCK_GAS_LIMIT,
 };
 
-use crate::eth_provider::error::{EthApiError, EthereumDataFormatError, SignatureError, TransactionError};
-
-pub fn rpc_to_primitive_transaction(
-    rpc_transaction: reth_rpc_types::Transaction,
-) -> Result<reth_primitives::Transaction, EthereumDataFormatError> {
-    match rpc_transaction
-        .transaction_type
-        .ok_or(EthereumDataFormatError::PrimitiveError)?
-        .try_into()
-        .map_err(|_| EthereumDataFormatError::PrimitiveError)?
-    {
-        TxType::Legacy => Ok(reth_primitives::Transaction::Legacy(TxLegacy {
-            nonce: rpc_transaction.nonce,
-            gas_price: rpc_transaction.gas_price.ok_or(EthereumDataFormatError::PrimitiveError)?,
-            gas_limit: rpc_transaction.gas.try_into().map_err(|_| EthereumDataFormatError::PrimitiveError)?,
-            to: rpc_transaction.to.map_or_else(|| TransactionKind::Create, TransactionKind::Call),
-            value: rpc_transaction.value,
-            input: rpc_transaction.input,
-            chain_id: rpc_transaction.chain_id,
-        })),
-        TxType::Eip2930 => Ok(reth_primitives::Transaction::Eip2930(TxEip2930 {
-            chain_id: rpc_transaction.chain_id.ok_or(EthereumDataFormatError::PrimitiveError)?,
-            nonce: rpc_transaction.nonce,
-            gas_price: rpc_transaction.gas_price.ok_or(EthereumDataFormatError::PrimitiveError)?,
-            gas_limit: rpc_transaction.gas.try_into().map_err(|_| EthereumDataFormatError::PrimitiveError)?,
-            to: rpc_transaction.to.map_or_else(|| TransactionKind::Create, TransactionKind::Call),
-            value: rpc_transaction.value,
-            access_list: AccessList(
-                rpc_transaction
-                    .access_list
-                    .unwrap_or_default()
-                    .0
-                    .into_iter()
-                    .map(|access_list| AccessListItem {
-                        address: access_list.address,
-                        storage_keys: access_list.storage_keys,
-                    })
-                    .collect(),
-            ),
-            input: rpc_transaction.input,
-        })),
-        TxType::Eip1559 => Ok(reth_primitives::Transaction::Eip1559(TxEip1559 {
-            chain_id: rpc_transaction.chain_id.ok_or(EthereumDataFormatError::PrimitiveError)?,
-            nonce: rpc_transaction.nonce,
-            gas_limit: rpc_transaction.gas.try_into().map_err(|_| EthereumDataFormatError::PrimitiveError)?,
-            max_fee_per_gas: rpc_transaction.max_fee_per_gas.ok_or(EthereumDataFormatError::PrimitiveError)?,
-            max_priority_fee_per_gas: rpc_transaction
-                .max_priority_fee_per_gas
-                .ok_or(EthereumDataFormatError::PrimitiveError)?,
-            to: rpc_transaction.to.map_or_else(|| TransactionKind::Create, TransactionKind::Call),
-            value: rpc_transaction.value,
-            access_list: AccessList(
-                rpc_transaction
-                    .access_list
-                    .unwrap_or_default()
-                    .0
-                    .into_iter()
-                    .map(|access_list| AccessListItem {
-                        address: access_list.address,
-                        storage_keys: access_list.storage_keys,
-                    })
-                    .collect(),
-            ),
-            input: rpc_transaction.input,
-        })),
-        _ => Err(EthereumDataFormatError::PrimitiveError),
+/// Validates the signed ethereum transaction.
+/// The validation checks the following:
+/// - The transaction gas limit is lower than the tracing block gas limit.
+/// - The transaction chain id (if any) is the same as the one provided.
+/// - The transaction hash is whitelisted for pre EIP-155 transactions.
+pub(crate) fn validate_transaction(transaction_signed: &TransactionSigned, chain_id: u64) -> Result<(), EthApiError> {
+    // If the transaction gas limit is higher than the tracing
+    // block gas limit, prevent the transaction from being sent
+    // (it will revert anyway on the Starknet side). This assures
+    // that all transactions are traceable.
+    if transaction_signed.gas_limit() > TRACING_BLOCK_GAS_LIMIT {
+        return Err(TransactionError::GasOverflow.into());
     }
+
+    // Recover the signer from the transaction
+    let _ = transaction_signed.recover_signer().ok_or(SignatureError::Recovery)?;
+
+    // Assert the chain is correct
+    let maybe_chain_id = transaction_signed.chain_id();
+    if !maybe_chain_id.map_or(true, |c| c == chain_id) {
+        return Err(TransactionError::InvalidChainId.into());
+    }
+
+    // If the transaction is a pre EIP-155 transaction, check if hash is whitelisted
+    if maybe_chain_id.is_none() && !WHITE_LISTED_EIP_155_TRANSACTION_HASHES.contains(&transaction_signed.hash) {
+        return Err(TransactionError::InvalidTransactionType.into());
+    }
+
+    Ok(())
 }
 
-pub fn rpc_to_ec_recovered_transaction(
-    transaction: reth_rpc_types::Transaction,
-) -> Result<reth_primitives::TransactionSignedEcRecovered, EthApiError> {
-    let signature = transaction.signature.ok_or(SignatureError::MissingSignature)?;
-    let transaction = rpc_to_primitive_transaction(transaction)?;
+/// Returns the transaction's signature as a [`Vec<FieldElement>`].
+/// Fields r and s are split into two 16-bytes chunks both converted
+/// to [`FieldElement`].
+pub(crate) fn transaction_signature_to_field_elements(transaction_signed: &TransactionSigned) -> Vec<FieldElement> {
+    let transaction_signature = transaction_signed.signature();
 
-    let parity = match transaction.tx_type() {
-        TxType::Legacy => {
-            // EIP-155: v = {0, 1} + CHAIN_ID * 2 + 35
-            let chain_id = transaction.chain_id().ok_or(TransactionError::InvalidChainId)?;
-            let recovery = chain_id.saturating_mul(2).saturating_add(35);
-            signature.v - U256::from(recovery)
-        }
-        TxType::Eip1559 | TxType::Eip2930 | TxType::Eip4844 => signature.v,
-    };
+    let mut signature = Vec::with_capacity(5);
+    signature.extend_from_slice(&split_u256(transaction_signature.r));
+    signature.extend_from_slice(&split_u256(transaction_signature.s));
 
-    let tx_signed = TransactionSigned::from_transaction_and_signature(
-        transaction,
-        Signature {
-            r: signature.r,
-            s: signature.s,
-            odd_y_parity: parity.try_into().map_err(|_| SignatureError::InvalidParity)?,
-        },
-    );
+    // Push the last element of the signature
+    // In case of a Legacy Transaction, it is v := {0, 1} + chain_id * 2 + 35
+    // or {0, 1} + 27 for pre EIP-155 transactions.
+    // Else, it is odd_y_parity
+    if let Transaction::Legacy(_) = transaction_signed.transaction {
+        let chain_id = transaction_signed.chain_id();
+        signature.push(transaction_signature.v(chain_id).into());
+    } else {
+        signature.push(u64::from(transaction_signature.odd_y_parity).into());
+    }
 
-    let tx_ec_recovered = tx_signed.try_into_ecrecovered().map_err(|_| SignatureError::RecoveryError)?;
-    Ok(tx_ec_recovered)
+    signature
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use reth_primitives::{Address, Bytes, U256};
-    use reth_rpc_types::AccessListItem as RpcAccessListItem;
-    use std::str::FromStr;
+/// Returns the transaction's data RLP encoded without the signature as a [`Vec<FieldElement>`].
+/// The data is appended to the Starknet invoke transaction calldata.
+///
+/// # Example
+///
+/// For Legacy Transactions: rlp([nonce, `gas_price`, `gas_limit`, to, value, data, `chain_id`, 0, 0])
+/// is then converted to a [`Vec<FieldElement>`], packing the data in 31-byte chunks.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn transaction_data_to_starknet_calldata(
+    transaction_signed: &TransactionSigned,
+    retries: u8,
+) -> Result<Vec<FieldElement>, EthApiError> {
+    let mut signed_data = Vec::with_capacity(transaction_signed.transaction.length());
+    transaction_signed.transaction.encode_without_signature(&mut signed_data);
 
-    struct RpcTxBuilder {
-        tx: reth_rpc_types::Transaction,
+    // Pack the calldata in 31-byte chunks
+    let mut signed_data: Vec<FieldElement> = std::iter::once(FieldElement::from(signed_data.len()))
+        .chain(signed_data.chunks(31).filter_map(|chunk_bytes| FieldElement::from_byte_slice_be(chunk_bytes).ok()))
+        .collect();
+
+    // Prepare the calldata for the Starknet invoke transaction
+    let capacity = 6 + signed_data.len();
+
+    // Check if call data is too large
+    #[cfg(not(feature = "hive"))]
+    if capacity > *MAX_FELTS_IN_CALLDATA {
+        return Err(EthApiError::CalldataExceededLimit(*MAX_FELTS_IN_CALLDATA, capacity));
     }
 
-    impl RpcTxBuilder {
-        fn new() -> Self {
-            Self {
-                tx: reth_rpc_types::Transaction {
-                    nonce: 1,
-                    from: Address::from_str("0x0000000000000000000000000000000000000001").unwrap(),
-                    to: Some(Address::from_str("0x0000000000000000000000000000000000000002").unwrap()),
-                    value: U256::from(100),
-                    gas_price: Some(20),
-                    gas: 21000,
-                    input: Bytes::from("1234"),
-                    signature: Some(reth_rpc_types::Signature {
-                        r: U256::from(1),
-                        s: U256::from(2),
-                        v: U256::from(38),
-                        y_parity: None,
-                    }),
-                    chain_id: Some(1),
-                    transaction_type: Some(0),
-                    ..Default::default()
-                },
-            }
-        }
+    let mut calldata = Vec::with_capacity(capacity);
 
-        fn with_transaction_type(mut self, tx_type: TxType) -> Self {
-            match tx_type {
-                TxType::Eip2930 | TxType::Eip1559 => {
-                    if let Some(sig) = self.tx.signature.as_mut() {
-                        sig.v = U256::from(1);
-                        sig.y_parity = Some(reth_rpc_types::Parity(true));
-                    }
-                }
-                _ => {}
-            }
-            self.tx.transaction_type = Some(tx_type as u8);
-            self
-        }
+    // assert that the selector < FieldElement::MAX - retries
+    assert!(*ETH_SEND_TRANSACTION < FieldElement::MAX - retries.into());
+    let selector = *ETH_SEND_TRANSACTION + retries.into();
 
-        fn with_access_list(mut self) -> Self {
-            self.tx.access_list = Some(reth_rpc_types::AccessList(vec![RpcAccessListItem {
-                address: Address::from_str("0x0000000000000000000000000000000000000003").unwrap(),
-                storage_keys: vec![U256::from(123).into(), U256::from(456).into()],
-            }]));
-            self
-        }
+    // Retries are used to alter the transaction hash in order to avoid the
+    // `DuplicateTx` error from the Starknet gateway, encountered whenever
+    // a transaction with the same hash is sent multiple times.
+    // We add the retries to the selector in the calldata, since the selector
+    // is not used by the EOA contract during the transaction execution.
+    calldata.append(&mut vec![
+        FieldElement::ONE,        // call array length
+        *KAKAROT_ADDRESS,         // contract address
+        selector,                 // selector + retries
+        FieldElement::ZERO,       // data offset
+        signed_data.len().into(), // data length
+        signed_data.len().into(), // calldata length
+    ]);
+    calldata.append(&mut signed_data);
 
-        fn with_fee_market(mut self) -> Self {
-            self.tx.max_fee_per_gas = Some(30);
-            self.tx.max_priority_fee_per_gas = Some(10);
-            self
-        }
-
-        fn build(self) -> reth_rpc_types::Transaction {
-            self.tx
-        }
-    }
-
-    // Helper to create a legacy transaction
-    fn legacy_rpc_transaction() -> reth_rpc_types::Transaction {
-        RpcTxBuilder::new().with_transaction_type(TxType::Legacy).build()
-    }
-
-    // Helper to create an EIP-2930 transaction
-    fn eip2930_rpc_transaction() -> reth_rpc_types::Transaction {
-        RpcTxBuilder::new().with_transaction_type(TxType::Eip2930).with_access_list().build()
-    }
-
-    // Helper to create an EIP-1559 transaction
-    fn eip1559_rpc_transaction() -> reth_rpc_types::Transaction {
-        RpcTxBuilder::new().with_transaction_type(TxType::Eip1559).with_access_list().with_fee_market().build()
-    }
-
-    macro_rules! assert_common_fields {
-        ($tx: expr, $rpc_tx: expr, $gas_price_field: ident, $has_access_list: expr) => {
-            assert_eq!($tx.chain_id(), $rpc_tx.chain_id);
-            assert_eq!($tx.nonce(), $rpc_tx.nonce);
-            assert_eq!($tx.max_fee_per_gas(), $rpc_tx.$gas_price_field.unwrap());
-            assert_eq!($tx.max_priority_fee_per_gas(), $rpc_tx.max_priority_fee_per_gas);
-            assert_eq!($tx.gas_limit() as u128, $rpc_tx.gas);
-            assert_eq!($tx.value(), $rpc_tx.value);
-            assert_eq!($tx.input().clone(), $rpc_tx.input);
-            assert_eq!($tx.to().unwrap(), $rpc_tx.to.unwrap());
-            if $has_access_list {
-                assert_eq!(
-                    $tx.access_list().cloned().unwrap(),
-                    AccessList(
-                        $rpc_tx
-                            .access_list
-                            .unwrap()
-                            .0
-                            .into_iter()
-                            .map(|access_list| AccessListItem {
-                                address: access_list.address,
-                                storage_keys: access_list.storage_keys,
-                            })
-                            .collect()
-                    )
-                );
-            }
-        };
-    }
-
-    // Macro to create the tests for rpc to primitive transaction conversion
-    macro_rules! test_rpc_to_primitive_conversion {
-        ($test_name: ident, $tx_initializer: ident, $gas_price_field: ident, $has_access_list: expr) => {
-            #[test]
-            fn $test_name() {
-                // Given
-                let rpc_tx = $tx_initializer();
-
-                // When
-                let tx = rpc_to_primitive_transaction(rpc_tx.clone())
-                    .expect("Failed to convert RPC transaction to ec recovered");
-
-                // Then
-                assert_common_fields!(tx, rpc_tx, $gas_price_field, $has_access_list);
-            }
-        };
-    }
-
-    // Macro to create the tests for rpc to ec recovered transaction conversion
-    macro_rules! test_rpc_to_ec_recovered_conversion {
-        ($test_name: ident, $tx_initializer: ident, $gas_price_field: ident, $has_access_list: expr) => {
-            #[test]
-            fn $test_name() {
-                // Given
-                let rpc_tx = $tx_initializer();
-
-                // When
-                let tx = rpc_to_ec_recovered_transaction(rpc_tx.clone())
-                    .expect("Failed to convert RPC transaction to primitive");
-
-                // Then
-                assert_common_fields!(tx, rpc_tx, $gas_price_field, $has_access_list);
-                let mut v = rpc_tx.signature.unwrap().v.to::<u64>();
-                v = if v > 1 { v - tx.chain_id().unwrap() * 2 - 35 } else { v };
-                assert_eq!(
-                    tx.signature,
-                    rpc_tx.signature.map(|sig| Signature { r: sig.r, s: sig.s, odd_y_parity: v != 0 }).unwrap()
-                );
-            }
-        };
-    }
-
-    test_rpc_to_primitive_conversion!(
-        test_legacy_transaction_conversion_to_primitive,
-        legacy_rpc_transaction,
-        gas_price,
-        false
-    );
-
-    test_rpc_to_ec_recovered_conversion!(
-        test_legacy_transaction_conversion_to_ec_recovered,
-        legacy_rpc_transaction,
-        gas_price,
-        false
-    );
-
-    test_rpc_to_primitive_conversion!(
-        test_eip2930_transaction_conversion_to_primitive,
-        eip2930_rpc_transaction,
-        gas_price,
-        true
-    );
-    test_rpc_to_ec_recovered_conversion!(
-        test_eip2930_transaction_conversion_to_ec_recovered,
-        eip2930_rpc_transaction,
-        gas_price,
-        true
-    );
-
-    test_rpc_to_primitive_conversion!(
-        test_eip1559_transaction_conversion_to_primitive,
-        eip1559_rpc_transaction,
-        max_fee_per_gas,
-        true
-    );
-
-    test_rpc_to_ec_recovered_conversion!(
-        test_eip1559_transaction_conversion_to_ec_recovered,
-        eip1559_rpc_transaction,
-        max_fee_per_gas,
-        true
-    );
-
-    #[test]
-    #[should_panic(expected = "PrimitiveError")]
-    fn test_invalid_transaction_type() {
-        let mut rpc_tx = RpcTxBuilder::new().build();
-        rpc_tx.transaction_type = Some(99); // Invalid type
-
-        let _ = rpc_to_primitive_transaction(rpc_tx).unwrap();
-    }
+    Ok(calldata)
 }

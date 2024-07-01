@@ -1,5 +1,5 @@
 ---
-name: test
+name: rust test
 
 on:
   workflow_call:
@@ -11,11 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Setup rust env
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@stable
         with:
-          profile: minimal
-          components: llvm-tools-preview, rustfmt, clippy
-          override: true
+          components: rustfmt, clippy
           toolchain: 1.76.0
       - name: Retrieve cached dependencies
         uses: Swatinem/rust-cache@v2
@@ -85,7 +83,7 @@ jobs:
           platforms: linux/amd64
           build-args: |
             GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }}
-            APIBARA_STARKNET_BIN_DIR=dsrifc349xgnwsv661shqljxb8pbxx2j
+            APIBARA_STARKNET_BIN_DIR=ns4qwsl6fgbv7mxhxpnaqhd66wnic8i6
             APIBARA_SINK_BIN_DIR=sci7y4a8r7yz05094pl88h3d7vv1s98f
           outputs: type=docker,dest=./artifacts/kakarot_image.tar
       - name: Checkout hive tests

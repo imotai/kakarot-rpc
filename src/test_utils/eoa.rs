@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use alloy_dyn_abi::DynSolValue;
+use alloy_json_abi::ContractObject;
+use alloy_signer_wallet::LocalWallet;
 use async_trait::async_trait;
-use ethers::abi::Tokenize;
-use ethers::signers::{LocalWallet, Signer};
-use ethers_solc::artifacts::CompactContractBytecode;
-use reth_primitives::{sign_message, Address, Transaction, TransactionKind, TransactionSigned, TxEip1559, B256, U256};
+use reth_primitives::{sign_message, Address, Transaction, TransactionSigned, TxEip1559, TxKind, B256, U256};
 use starknet::core::types::{MaybePendingTransactionReceipt, TransactionReceipt};
 use starknet::core::utils::get_selector_from_name;
 use starknet::providers::Provider;
@@ -29,8 +29,8 @@ pub trait Eoa<P: Provider + Send + Sync> {
         Ok(starknet_address(self.evm_address()?))
     }
     fn evm_address(&self) -> Result<Address, eyre::Error> {
-        let wallet = LocalWallet::from_bytes(self.private_key().as_slice())?;
-        Ok(Address::from_slice(wallet.address().as_bytes()))
+        let wallet = LocalWallet::from_bytes(&self.private_key())?;
+        Ok(wallet.address())
     }
     fn private_key(&self) -> B256;
     fn eth_provider(&self) -> &EthDataProvider<P>;
@@ -90,11 +90,11 @@ impl<P: Provider + Send + Sync> KakarotEOA<P> {
     }
 
     /// Deploys an EVM contract given a contract name and constructor arguments
-    /// Returns a KakarotEvmContract instance
-    pub async fn deploy_evm_contract<T: Tokenize>(
+    /// Returns a `KakarotEvmContract` instance
+    pub async fn deploy_evm_contract(
         &self,
         contract_name: Option<&str>,
-        constructor_args: T,
+        constructor_args: &[DynSolValue],
     ) -> Result<KakarotEvmContract, eyre::Error> {
         let nonce = self.nonce().await?;
         let nonce: u64 = nonce.try_into()?;
@@ -104,7 +104,7 @@ impl<P: Provider + Send + Sync> KakarotEOA<P> {
         let bytecode = if let Some(name) = contract_name {
             <KakarotEvmContract as EvmContract>::load_contract_bytecode(name)?
         } else {
-            CompactContractBytecode::default()
+            ContractObject::default()
         };
 
         let expected_address = {
@@ -124,7 +124,7 @@ impl<P: Provider + Send + Sync> KakarotEOA<P> {
             <KakarotEvmContract as EvmContract>::prepare_create_transaction(
                 &bytecode,
                 constructor_args,
-                &TxCommonInfo { nonce, chain_id: chain_id.try_into()?, ..Default::default() },
+                &TxCommonInfo { nonce, chain_id: Some(chain_id.try_into()?), ..Default::default() },
             )?
         };
         let tx_signed = self.sign_transaction(tx)?;
@@ -146,9 +146,8 @@ impl<P: Provider + Send + Sync> KakarotEOA<P> {
             .await
             .expect("Failed to get transaction receipt after retries");
 
-        let receipt = match maybe_receipt {
-            MaybePendingTransactionReceipt::Receipt(TransactionReceipt::Invoke(receipt)) => receipt,
-            _ => return Err(eyre::eyre!("Failed to deploy contract")),
+        let MaybePendingTransactionReceipt::Receipt(TransactionReceipt::Invoke(receipt)) = maybe_receipt else {
+            return Err(eyre::eyre!("Failed to deploy contract"));
         };
 
         let selector = get_selector_from_name("evm_contract_deployed").unwrap(); // safe unwrap
@@ -162,14 +161,14 @@ impl<P: Provider + Send + Sync> KakarotEOA<P> {
         Ok(KakarotEvmContract::new(bytecode, event.data[1], event.data[0]))
     }
 
-    /// Calls a KakarotEvmContract function and returns the Starknet transaction hash
+    /// Calls a `KakarotEvmContract` function and returns the Starknet transaction hash
     /// The transaction is signed and sent by the EOA
     /// The transaction is waited for until it is confirmed
-    pub async fn call_evm_contract<T: Tokenize>(
+    pub async fn call_evm_contract(
         &self,
         contract: &KakarotEvmContract,
         function: &str,
-        args: T,
+        args: &[DynSolValue],
         value: u128,
     ) -> Result<Transaction, eyre::Error> {
         let nonce = self.nonce().await?.try_into()?;
@@ -179,7 +178,7 @@ impl<P: Provider + Send + Sync> KakarotEOA<P> {
             function,
             args,
             &TransactionInfo::FeeMarketInfo(TxFeeMarketInfo {
-                common: TxCommonInfo { chain_id, nonce, value },
+                common: TxCommonInfo { chain_id: Some(chain_id), nonce, value },
                 ..Default::default()
             }),
         )?;
@@ -203,7 +202,7 @@ impl<P: Provider + Send + Sync> KakarotEOA<P> {
             chain_id: self.eth_provider.chain_id().await?.unwrap_or_default().try_into()?,
             nonce: self.nonce().await?.try_into()?,
             gas_limit: TX_GAS_LIMIT,
-            to: TransactionKind::Call(to),
+            to: TxKind::Call(to),
             value: U256::from(value),
             ..Default::default()
         });
@@ -215,15 +214,16 @@ impl<P: Provider + Send + Sync> KakarotEOA<P> {
     }
 
     /// Mocks a transaction with the given nonce without executing it
-    pub fn mock_transaction_with_nonce(&self, nonce: u64) -> Result<reth_rpc_types::Transaction, eyre::Error> {
+    pub async fn mock_transaction_with_nonce(&self, nonce: u64) -> Result<reth_rpc_types::Transaction, eyre::Error> {
+        let chain_id = self.eth_provider.chain_id().await?.unwrap_or_default().to();
         Ok(from_recovered(TransactionSignedEcRecovered::from_signed_transaction(
             self.sign_transaction(Transaction::Eip1559(TxEip1559 {
-                chain_id: 1,
+                chain_id,
                 nonce,
                 gas_limit: 21000,
-                to: TransactionKind::Call(Address::random()),
+                to: TxKind::Call(Address::random()),
                 value: U256::from(1000),
-                max_fee_per_gas: 875000000,
+                max_fee_per_gas: 875_000_000,
                 ..Default::default()
             }))?,
             self.evm_address()?,

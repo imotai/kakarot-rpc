@@ -43,7 +43,7 @@ lazy_static! {
 }
 
 pub const BLOCK_NUMBER: u64 = 0x1234;
-pub const RANDOM_BYTES_SIZE: usize = 100024;
+pub const RANDOM_BYTES_SIZE: usize = 100_024;
 
 pub fn generate_port_number() -> u16 {
     let address = "0.0.0.0:0";
@@ -65,7 +65,7 @@ pub enum CollectionDB {
     Logs,
 }
 
-/// Type alias for the different types of stored data associated with each CollectionDB.
+/// Type alias for the different types of stored data associated with each `CollectionDB`.
 #[derive(Eq, PartialEq, Clone, Debug)]
 pub enum StoredData {
     /// Represents a stored header associated with a CollectionDB.
@@ -80,25 +80,33 @@ pub enum StoredData {
 
 impl StoredData {
     /// Extracts the stored header if it exists, otherwise returns None.
-    pub fn extract_stored_header(&self) -> Option<&StoredHeader> {
+    pub const fn extract_stored_header(&self) -> Option<&StoredHeader> {
         match self {
-            StoredData::StoredHeader(header) => Some(header),
+            Self::StoredHeader(header) => Some(header),
             _ => None,
         }
     }
 
     /// Extracts the stored transaction if it exists, otherwise returns None.
-    pub fn extract_stored_transaction(&self) -> Option<&StoredTransaction> {
+    pub const fn extract_stored_transaction(&self) -> Option<&StoredTransaction> {
         match self {
-            StoredData::StoredTransaction(transaction) => Some(transaction),
+            Self::StoredTransaction(transaction) => Some(transaction),
             _ => None,
         }
     }
 
     /// Extracts the stored transaction receipt if it exists, otherwise returns None.
-    pub fn extract_stored_transaction_receipt(&self) -> Option<&StoredTransactionReceipt> {
+    pub const fn extract_stored_transaction_receipt(&self) -> Option<&StoredTransactionReceipt> {
         match self {
-            StoredData::StoredTransactionReceipt(receipt) => Some(receipt),
+            Self::StoredTransactionReceipt(receipt) => Some(receipt),
+            _ => None,
+        }
+    }
+
+    /// Extracts the stored log if it exists, otherwise returns None.
+    pub const fn extract_stored_log(&self) -> Option<&StoredLog> {
+        match self {
+            Self::StoredLog(log) => Some(log),
             _ => None,
         }
     }
@@ -110,15 +118,15 @@ impl Serialize for StoredData {
         S: Serializer,
     {
         match self {
-            StoredData::StoredHeader(header) => header.serialize(serializer),
-            StoredData::StoredTransaction(transaction) => transaction.serialize(serializer),
-            StoredData::StoredTransactionReceipt(receipt) => receipt.serialize(serializer),
-            StoredData::StoredLog(log) => log.serialize(serializer),
+            Self::StoredHeader(header) => header.serialize(serializer),
+            Self::StoredTransaction(transaction) => transaction.serialize(serializer),
+            Self::StoredTransactionReceipt(receipt) => receipt.serialize(serializer),
+            Self::StoredLog(log) => log.serialize(serializer),
         }
     }
 }
 
-/// Struct representing a data generator for MongoDB.
+/// Struct representing a data generator for `MongoDB`.
 #[cfg(any(test, feature = "arbitrary", feature = "testing"))]
 #[derive(Debug)]
 pub struct MongoFuzzer {
@@ -158,23 +166,25 @@ impl MongoFuzzer {
         Self { documents: Default::default(), mongodb, rnd_bytes_size, port }
     }
 
-    /// Obtains an immutable reference to the documents HashMap.
-    pub fn documents(&self) -> &HashMap<CollectionDB, Vec<StoredData>> {
+    /// Obtains an immutable reference to the documents `HashMap`.
+
+    pub const fn documents(&self) -> &HashMap<CollectionDB, Vec<StoredData>> {
         &self.documents
     }
 
-    /// Get MongoDB image
+    /// Get `MongoDB` image
     pub fn mongo_image(&self) -> RunnableImage<GenericImage> {
         let image = GenericImage::new("mongo".to_string(), "6.0.13".to_string());
         RunnableImage::from(image).with_mapped_port((self.port, 27017))
     }
 
     /// Get port number
-    pub fn port(&self) -> u16 {
+
+    pub const fn port(&self) -> u16 {
         self.port
     }
 
-    /// Finalizes the data generation and returns the MongoDB database.
+    /// Finalizes the data generation and returns the `MongoDB` database.
     pub async fn finalize(&self) -> Database {
         for collection in CollectionDB::iter() {
             self.update_collection(collection).await;
@@ -215,6 +225,43 @@ impl MongoFuzzer {
         self.add_custom_transaction(builder)
     }
 
+    /// Adds random logs to the collection of logs.
+    pub fn add_random_logs(&mut self, n_logs: usize) -> Result<(), Box<dyn std::error::Error>> {
+        for _ in 0..n_logs {
+            let bytes: Vec<u8> = (0..self.rnd_bytes_size).map(|_| rand::random()).collect();
+            let mut unstructured = arbitrary::Unstructured::new(&bytes);
+            let mut log = StoredLog::arbitrary(&mut unstructured)?.log;
+
+            let topics = log.inner.data.topics_mut_unchecked();
+            topics.clear();
+            topics.extend([
+                B256::arbitrary(&mut unstructured)?,
+                B256::arbitrary(&mut unstructured)?,
+                B256::arbitrary(&mut unstructured)?,
+                B256::arbitrary(&mut unstructured)?,
+            ]);
+
+            // Ensure the block number in log <= max block number in the transactions collection.
+            log.block_number = Some(log.block_number.unwrap_or_default().min(self.max_block_number()));
+
+            let stored_log = StoredLog { log };
+
+            self.documents.entry(CollectionDB::Logs).or_default().push(StoredData::StoredLog(stored_log));
+        }
+        Ok(())
+    }
+
+    /// Gets the highest block number in the transactions collection.
+    pub fn max_block_number(&self) -> u64 {
+        self.documents
+            .get(&CollectionDB::Headers)
+            .unwrap()
+            .iter()
+            .map(|header| header.extract_stored_header().unwrap().header.number.unwrap_or_default())
+            .max()
+            .unwrap_or_default()
+    }
+
     /// Adds a hardcoded transaction to the collection of transactions.
     pub fn add_random_transaction(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let builder = TransactionBuilder::default();
@@ -248,6 +295,13 @@ impl MongoFuzzer {
         let mut unstructured = arbitrary::Unstructured::new(&bytes);
         let mut receipt = StoredTransactionReceipt::arbitrary(&mut unstructured).unwrap();
 
+        // Ensure the block number in receipt is equal to the block number in transaction.
+        let mut modified_logs = (*receipt.receipt.inner.as_receipt_with_bloom().unwrap()).clone();
+        for log in &mut modified_logs.receipt.logs {
+            log.block_number = Some(transaction.block_number.unwrap_or_default());
+            log.block_hash = transaction.block_hash;
+        }
+
         receipt.receipt.transaction_hash = transaction.hash;
         receipt.receipt.transaction_index = Some(transaction.transaction_index.unwrap_or_default());
         receipt.receipt.from = transaction.from;
@@ -255,18 +309,10 @@ impl MongoFuzzer {
         receipt.receipt.block_number = transaction.block_number;
         receipt.receipt.block_hash = transaction.block_hash;
         receipt.receipt.inner = match transaction.transaction_type.unwrap_or_default().try_into() {
-            Ok(TxType::Legacy) => reth_rpc_types::ReceiptEnvelope::Legacy(
-                (*receipt.receipt.inner.as_receipt_with_bloom().unwrap()).clone(),
-            ),
-            Ok(TxType::Eip2930) => reth_rpc_types::ReceiptEnvelope::Eip2930(
-                (*receipt.receipt.inner.as_receipt_with_bloom().unwrap()).clone(),
-            ),
-            Ok(TxType::Eip1559) => reth_rpc_types::ReceiptEnvelope::Eip1559(
-                (*receipt.receipt.inner.as_receipt_with_bloom().unwrap()).clone(),
-            ),
-            Ok(TxType::Eip4844) => reth_rpc_types::ReceiptEnvelope::Eip4844(
-                (*receipt.receipt.inner.as_receipt_with_bloom().unwrap()).clone(),
-            ),
+            Ok(TxType::Legacy) => reth_rpc_types::ReceiptEnvelope::Legacy(modified_logs),
+            Ok(TxType::Eip2930) => reth_rpc_types::ReceiptEnvelope::Eip2930(modified_logs),
+            Ok(TxType::Eip1559) => reth_rpc_types::ReceiptEnvelope::Eip1559(modified_logs),
+            Ok(TxType::Eip4844) => reth_rpc_types::ReceiptEnvelope::Eip4844(modified_logs),
             Err(_) => unreachable!(),
         };
         receipt
@@ -349,7 +395,8 @@ pub struct TransactionBuilder {
 
 impl TransactionBuilder {
     /// Specifies the type of transaction to build.
-    pub fn with_tx_type(mut self, tx_type: TxType) -> Self {
+    #[must_use]
+    pub const fn with_tx_type(mut self, tx_type: TxType) -> Self {
         self.tx_type = Some(tx_type);
         self
     }
@@ -427,7 +474,7 @@ impl TransactionBuilder {
                         ..Default::default()
                     },
                 },
-                _ => unimplemented!(),
+                TxType::Eip4844 => unimplemented!(),
             });
         }
 

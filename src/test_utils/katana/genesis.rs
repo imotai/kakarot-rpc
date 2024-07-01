@@ -3,11 +3,9 @@ use std::fs;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 
-use ethers::signers::LocalWallet;
-use ethers::signers::Signer;
-use ethers::types::U256;
+use crate::eth_provider::utils::split_u256;
+use alloy_signer_wallet::LocalWallet;
 use eyre::{eyre, OptionExt, Result};
-use katana_primitives::block::GasPrices;
 use katana_primitives::contract::{StorageKey, StorageValue};
 use katana_primitives::genesis::allocation::DevAllocationsGenerator;
 use katana_primitives::genesis::constant::DEFAULT_FEE_TOKEN_ADDRESS;
@@ -20,7 +18,7 @@ use katana_primitives::{
 };
 use lazy_static::lazy_static;
 use rayon::prelude::*;
-use reth_primitives::B256;
+use reth_primitives::{B256, U256};
 use serde::Serialize;
 use serde_json::Value;
 use serde_with::serde_as;
@@ -52,15 +50,15 @@ pub struct KatanaManifest {
     pub deployments: HashMap<String, Hex>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Uninitialized;
 #[derive(Debug, Clone)]
 pub struct Loaded;
 #[derive(Debug, Clone)]
 pub struct Initialized;
 
-#[derive(Debug, Clone)]
-pub struct KatanaGenesisBuilder<T> {
+#[derive(Debug, Clone, Default)]
+pub struct KatanaGenesisBuilder<T = Uninitialized> {
     coinbase: FieldElement,
     classes: Vec<GenesisClassJson>,
     class_hashes: HashMap<String, FieldElement>,
@@ -77,7 +75,7 @@ fn parse_seed(seed: &str) -> [u8; 32] {
     let seed = seed.as_bytes();
 
     if seed.len() >= 32 {
-        unsafe { *(seed[..32].as_ptr() as *const [u8; 32]) }
+        unsafe { *seed[..32].as_ptr().cast::<[u8; 32]>() }
     } else {
         let mut actual_seed = [0u8; 32];
         seed.iter().enumerate().for_each(|(i, b)| actual_seed[i] = *b);
@@ -99,9 +97,10 @@ impl<T> KatanaGenesisBuilder<T> {
         }
     }
 
+    #[must_use]
     pub fn with_dev_allocation(mut self, amount: u16) -> Self {
         let dev_allocations = DevAllocationsGenerator::new(amount)
-            .with_balance(DEFAULT_PREFUNDED_ACCOUNT_BALANCE)
+            .with_balance(U256::from(DEFAULT_PREFUNDED_ACCOUNT_BALANCE))
             .with_seed(parse_seed("0"))
             .generate()
             .into_iter()
@@ -119,45 +118,28 @@ impl<T> KatanaGenesisBuilder<T> {
                 )
             });
         self.accounts.extend(dev_allocations);
-
         self
     }
 
     fn kakarot_class_hash(&self) -> Result<FieldElement> {
-        self.class_hashes.get("kakarot").cloned().ok_or_eyre("Missing Kakarot class hash")
+        self.class_hashes.get("kakarot").copied().ok_or_eyre("Missing Kakarot class hash")
     }
 
     pub fn account_contract_class_hash(&self) -> Result<FieldElement> {
-        self.class_hashes.get("account_contract").cloned().ok_or_eyre("Missing account contract class hash")
+        self.class_hashes.get("account_contract").copied().ok_or_eyre("Missing account contract class hash")
     }
 
     pub fn uninitialized_account_class_hash(&self) -> Result<FieldElement> {
-        self.class_hashes.get("uninitialized_account").cloned().ok_or_eyre("Missing uninitialized account class hash")
+        self.class_hashes.get("uninitialized_account").copied().ok_or_eyre("Missing uninitialized account class hash")
     }
 
     pub fn cairo1_helpers_class_hash(&self) -> Result<FieldElement> {
-        self.class_hashes.get("cairo1_helpers").cloned().ok_or_eyre("Missing cairo1 helpers class hash")
-    }
-}
-
-impl Default for KatanaGenesisBuilder<Uninitialized> {
-    fn default() -> Self {
-        KatanaGenesisBuilder {
-            coinbase: FieldElement::ZERO,
-            classes: vec![],
-            class_hashes: HashMap::new(),
-            contracts: HashMap::new(),
-            accounts: HashMap::new(),
-            fee_token_storage: HashMap::new(),
-            cache: HashMap::new(),
-            status: PhantomData::<Uninitialized>,
-        }
+        self.class_hashes.get("cairo1_helpers").copied().ok_or_eyre("Missing cairo1 helpers class hash")
     }
 }
 
 impl KatanaGenesisBuilder<Uninitialized> {
     /// Load the classes from the given path. Computes the class hashes and stores them in the builder.
-    #[must_use]
     pub fn load_classes(mut self, path: PathBuf) -> KatanaGenesisBuilder<Loaded> {
         let entries = WalkDir::new(path).into_iter().filter(|e| e.is_ok() && e.as_ref().unwrap().file_type().is_file());
         let classes = entries
@@ -165,27 +147,20 @@ impl KatanaGenesisBuilder<Uninitialized> {
             .map(|entry| {
                 let path = entry.unwrap().path().to_path_buf();
                 let artifact = fs::read_to_string(&path).expect("Failed to read artifact");
-                (
-                    path,
-                    GenesisClassJson {
-                        class: PathOrFullArtifact::Artifact(
-                            serde_json::from_str(&artifact).expect("Failed to parse artifact"),
-                        ),
-                        class_hash: None,
-                    },
-                )
+                let artifact = serde_json::from_str(&artifact).expect("Failed to parse artifact");
+                let class_hash =
+                    compute_class_hash(&artifact).inspect_err(|e| eprint!("Failed to compute class hash: {e:?}")).ok();
+                (path, GenesisClassJson { class: PathOrFullArtifact::Artifact(artifact), class_hash })
             })
             .collect::<Vec<_>>();
 
         self.class_hashes = classes
-            .par_iter()
-            .filter_map(|(path, class)| {
-                let artifact = match &class.class {
-                    PathOrFullArtifact::Artifact(artifact) => artifact,
-                    PathOrFullArtifact::Path(_) => unreachable!("Expected artifact"),
-                };
-                let class_hash = compute_class_hash(artifact).ok()?;
-                Some((path.file_stem().unwrap().to_str().unwrap().to_string(), class_hash))
+            .iter()
+            .map(|(path, class)| {
+                (
+                    path.file_stem().unwrap().to_str().unwrap().to_string(),
+                    class.class_hash.expect("all class hashes should be computed"),
+                )
             })
             .collect();
         self.classes = classes.into_iter().map(|(_, class)| class).collect();
@@ -305,12 +280,9 @@ impl KatanaGenesisBuilder<Initialized> {
         let eoa = self.contracts.get_mut(&starknet_address).ok_or_eyre("Missing EOA contract")?;
 
         let key = get_storage_var_address("ERC20_balances", &[*starknet_address])?;
-        let low = amount & U256::from(u128::MAX);
-        let low: u128 = low.try_into().unwrap(); // safe to unwrap
-        let high = amount >> U256::from(128);
-        let high: u128 = high.try_into().unwrap(); // safe to unwrap
+        let amount_split = split_u256::<u128>(amount);
 
-        let storage = [(key, low.into()), (key + 1u8.into(), high.into())].into_iter();
+        let storage = [(key, amount_split[0].into()), (key + 1u8.into(), amount_split[1].into())].into_iter();
         self.fee_token_storage.extend(storage);
 
         eoa.balance = Some(amount);
@@ -318,27 +290,21 @@ impl KatanaGenesisBuilder<Initialized> {
         Ok(self)
     }
 
-    /// Consume the [KatanaGenesisBuilder] and returns the corresponding [GenesisJson].
+    /// Consume the [`KatanaGenesisBuilder`] and returns the corresponding [`GenesisJson`].
     pub fn build(self) -> Result<GenesisJson> {
         Ok(GenesisJson {
-            parent_hash: FieldElement::ZERO,
-            state_root: FieldElement::ZERO,
-            number: 0,
-            timestamp: 0,
             sequencer_address: self.compute_starknet_address(self.coinbase)?,
-            gas_prices: GasPrices::default(),
             classes: self.classes,
             fee_token: FeeTokenConfigJson {
                 name: "Ether".to_string(),
                 symbol: "ETH".to_string(),
                 decimals: 18,
                 storage: Some(self.fee_token_storage),
-                address: None,
-                class: None,
+                ..Default::default()
             },
-            universal_deployer: None,
             accounts: self.accounts,
             contracts: self.contracts,
+            ..Default::default()
         })
     }
 
@@ -363,33 +329,30 @@ impl KatanaGenesisBuilder<Initialized> {
         )))
     }
 
+    #[allow(clippy::unused_self)]
     fn evm_address(&self, pk: B256) -> Result<FieldElement> {
-        let wallet = LocalWallet::from_bytes(pk.as_slice())?;
-        let evm_address = wallet.address();
-        Ok(FieldElement::from_byte_slice_be(evm_address.as_bytes())?)
+        Ok(FieldElement::from_byte_slice_be(&LocalWallet::from_bytes(&pk)?.address().into_array())?)
     }
 
     pub fn cache_load(&self, key: &str) -> Result<FieldElement> {
-        self.cache.get(key).cloned().ok_or(eyre!("Cache miss for {key} address"))
+        self.cache.get(key).copied().ok_or(eyre!("Cache miss for {key} address"))
     }
 
-    pub fn cache(&self) -> &HashMap<String, FieldElement> {
+    pub const fn cache(&self) -> &HashMap<String, FieldElement> {
         &self.cache
     }
 
-    pub fn class_hashes(&self) -> &HashMap<String, FieldElement> {
+    pub const fn class_hashes(&self) -> &HashMap<String, FieldElement> {
         &self.class_hashes
     }
 }
 
 fn compute_class_hash(class: &Value) -> Result<FieldElement> {
-    match serde_json::from_value::<SierraClass>(class.clone()) {
-        Ok(sierra) => Ok(sierra.class_hash()?),
-        Err(_) => {
-            let casm: LegacyContractClass =
-                serde_json::from_value(class.clone()).expect("Failed to parse class code v0");
-            Ok(casm.class_hash()?)
-        }
+    if let Ok(sierra) = serde_json::from_value::<SierraClass>(class.clone()) {
+        Ok(sierra.class_hash()?)
+    } else {
+        let casm: LegacyContractClass = serde_json::from_value(class.clone()).expect("Failed to parse class code v0");
+        Ok(casm.class_hash()?)
     }
 }
 
